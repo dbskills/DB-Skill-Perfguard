@@ -106,13 +106,13 @@ class PerfGuard(nn.Module):
         self._feature_generator = None
 
     def forward(self, A1,A2,X1,X2):
-        A1 = torch.from_numpy(preprocess_adj(A1)).float().cuda(config.device)
-        X1 = self.dropout(torch.from_numpy(X1).cuda(config.device))
+        A1 = torch.from_numpy(preprocess_adj(A1)).float().to(config.device)
+        X1 = self.dropout(torch.from_numpy(X1).to(config.device))
         F1 = torch.bmm(A1.float(), X1.float())
         output_gcn1= self.gcn_layer1(F1)
 
-        A2 = torch.from_numpy(preprocess_adj(A2)).float().cuda(config.device)
-        X2 = self.dropout(torch.from_numpy(X2).cuda(config.device))
+        A2 = torch.from_numpy(preprocess_adj(A2)).float().to(config.device)
+        X2 = self.dropout(torch.from_numpy(X2).to(config.device))
         F2 = torch.bmm(A2.float(), X2.float())
         output_gcn2 = self.gcn_layer1(F2)
 
