@@ -152,9 +152,18 @@ class Get_Dataset_Test():
         with open(_input_feature_dim_path(path), "rb") as f:
             _input_feature_dim = joblib.load(f)
 
-        model = PerfGuard(_input_feature_dim,config.embd_dim, config.tensor_dim,config.dropout).cuda(config.device)
-        model = torch.nn.DataParallel(model, device_ids=config.GPU_LIST)
-        model.load_state_dict(torch.load(_nn_path(path)))
+        model = PerfGuard(_input_feature_dim,config.embd_dim, config.tensor_dim,config.dropout).to(config.device)
+        if config.CUDA:
+            model = torch.nn.DataParallel(model, device_ids=config.GPU_LIST)
+        state_dict = torch.load(_nn_path(path), map_location=config.device, weights_only=True)
+        # Handle DataParallel key prefix mismatch
+        if not isinstance(model, torch.nn.DataParallel):
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_key = k.replace('module.', '') if k.startswith('module.') else k
+                new_state_dict[new_key] = v
+            state_dict = new_state_dict
+        model.load_state_dict(state_dict)
         model.eval()
         if uncertainty == True:
             self.uncertainty(model)
