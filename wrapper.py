@@ -141,7 +141,38 @@ class ConnectionPool:
 # --------------------------------------------------------------------------- #
 # SQL parsing (schema-agnostic).
 # --------------------------------------------------------------------------- #
-def extract_tables_and_join_edges(sql):
+def _fetch_schema_columns(dsn):
+    """Fetch {table_name: set(column_names)} from pg_catalog."""
+    try:
+        conn = psycopg2.connect(dsn)
+    except Exception:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.relname, a.attname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute a ON a.attrelid = c.oid
+            WHERE c.relkind = 'r'
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND a.attnum > 0 AND NOT a.attisdropped
+        """)
+        tables = {}
+        for relname, attname in cur.fetchall():
+            tables.setdefault(relname, set()).add(attname)
+        cur.close()
+        return tables
+    except Exception:
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def extract_tables_and_join_edges(sql, schema_columns=None):
     parsed = sqlglot.parse_one(sql)
     tables = {}
     edges = []
@@ -159,18 +190,26 @@ def extract_tables_and_join_edges(sql):
     for join in parsed.find_all(sqlglot.exp.Join):
         for tbl in join.find_all(sqlglot.exp.Table):
             _add_table(tbl)
-        for sq in join.find_all(sqlglot.exp.Subquery):
-            alias = sq.alias_or_name.lower() if hasattr(sq, 'alias_or_name') else None
-            if alias:
-                tables[alias] = alias
-    for sq in parsed.find_all(sqlglot.exp.Subquery):
-        if sq.alias_or_name:
-            tables[sq.alias_or_name.lower()] = sq.alias_or_name.lower()
+    # Derived-table aliases aren't registered as Leading targets; the inner
+    # base tables (collected by find_all(Table) above, which descends into the
+    # subquery) are what reorder the subquery's joins once PG pulls them up.
+    # Bare-column resolver: TPC-H uses unqualified columns (table=""); resolve
+    # to owning FROM-alias via the per-DSN schema map. JOB is alias-qualified.
+    _sc = schema_columns or {}
+
+    def _resolve_col(col):
+        if col.table:
+            return col.table.lower()
+        for _alias, _name in tables.items():
+            if col.name in _sc.get(_name, ()):
+                return _alias
+        return ""
+
     for eq in parsed.find_all(sqlglot.exp.EQ):
         left_col, right_col = eq.left, eq.right
         if isinstance(left_col, sqlglot.exp.Column) and isinstance(right_col, sqlglot.exp.Column):
-            l_alias = (left_col.table or "").lower()
-            r_alias = (right_col.table or "").lower()
+            l_alias = _resolve_col(left_col)
+            r_alias = _resolve_col(right_col)
             if l_alias in tables and r_alias in tables and l_alias != r_alias:
                 edges.append((l_alias, r_alias))
     return tables, edges
@@ -225,6 +264,40 @@ def get_plan_json(conn, query, hint=None, analyze=False, timeout_ms=300000):
 def enable_hint_plan(conn):
     with conn.cursor() as cur:
         cur.execute("LOAD 'pg_hint_plan';")
+
+
+def _strip_subplan_children(plan_json):
+    """Drop 'SubPlan'/'InitPlan' children (Parent Relationship) from a plan
+    tree in place. PG attaches an uncorrelated scalar subquery (e.g. TPC-H
+    Q2 `col = (select min(...))`) as such a child of a join node, making it
+    3+-ary; the GCN feature parser assumes a binary plan tree. These are
+    constant scalar-subquery results, not real join children, so dropping
+    them keeps featurization and build_adjacency_matrix on the same binary
+    node set without affecting join-order optimization."""
+    def _walk(node):
+        if "Plans" not in node:
+            return
+        kids = node["Plans"]
+        kept = [c for c in kids
+                if c.get("Parent Relationship") not in ("SubPlan", "InitPlan")]
+        if kept:
+            node["Plans"] = kept
+            for c in kept:
+                _walk(c)
+        else:
+            # Drop empty/now-empty Plans: PG emits a bare "Plans": [] on
+            # some scan leaves (e.g. parallel-aware Index Scan); the GCN
+            # featurizer asserts len(children) > 0 when 'Plans' is present
+            # -> bare AssertionError(). Treat as a leaf.
+            del node["Plans"]
+    root = plan_json
+    if isinstance(root, list) and root and isinstance(root[0], dict) and "Plan" in root[0]:
+        root = root[0]["Plan"]
+    elif isinstance(root, dict) and "Plan" in root:
+        root = root["Plan"]
+    if isinstance(root, dict):
+        _walk(root)
+    return plan_json
 
 
 def build_adjacency_matrix(plan_json, max_nodes):
@@ -416,6 +489,8 @@ class PerfGuardSkill:
         self.candidate_limit = CANDIDATE_LIMIT_DEFAULT
         self.train_threshold = TRAIN_THRESHOLD_DEFAULT
         self.max_buffer_size = MAX_BUFFER_SIZE_DEFAULT
+        # Per-DSN schema cache for bare-column resolution.
+        self._schema_cols_cache = {}
         self._state_lock = threading.Lock()
         self._training_in_progress = False
         self._collecting_in_progress = False  # True while the bg thread is mid-EXPLAIN-ANALYZE collection
@@ -425,7 +500,7 @@ class PerfGuardSkill:
         self._bg_queue = queue_mod.Queue()
         self._bg_thread = threading.Thread(target=self._bg_loop, daemon=True)
         self._bg_thread.start()
-        # source module refs (imported lazily on first load)
+        # module refs (imported lazily on first load)
         self._util = None
         self._feature = None
         self._PerfGuard = None
@@ -545,6 +620,7 @@ class PerfGuardSkill:
         plans_for_fit = [default_plan] + [p for p in cand_plans if p is not None]
         if not plans_for_fit:
             return None, None
+        plans_for_fit = [_strip_subplan_children(p) for p in plans_for_fit]
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 fg = self._feature.FeatureGenerator()
@@ -586,6 +662,8 @@ class PerfGuardSkill:
     def _score_batch(self, fg, model, default_plan, cand_plans):
         """Batched pairwise scoring: one featurize + one model forward for all
         candidates vs the default. Returns (best_hint, best_score, num_valid)."""
+        if fg is None or model is None:
+            return None, -1.0, 0
         valid = [(i, p) for i, p in enumerate(cand_plans) if p is not None]
         if not valid:
             return None, -1.0, 0
@@ -600,14 +678,23 @@ class PerfGuardSkill:
                 return None, -1.0, 0
         # Featurize default + all candidates in one transform call.
         all_plans = [default_plan] + [p for _, p in valid]
-        feats, _ = fg.transform(all_plans)
+        # Strip scalar-subquery SubPlan/InitPlan children so the plan is a
+        # binary tree (GCN feature parser asserts <=2 children per node);
+        # also keeps fg.transform and build_adjacency_matrix on the same
+        # node set. Degrade on any residual featurization failure.
+        all_plans = [_strip_subplan_children(p) for p in all_plans]
+        try:
+            feats, _ = fg.transform(all_plans)
+        except Exception as e:
+            print(f"_score_batch featurization failed: {e}", file=sys.stderr)
+            return None, -1.0, 0
         prepared = self._util.prepare_trees(
             feats, lambda x: x.get_feature(), lambda x: x.get_left(),
             lambda x: x.get_right(), cuda=False, device=None)
         arrs = np.array(prepared)  # 3D: (n_plans, nodes, feat) — prepare_trees pads+combines
         max_nodes = arrs.shape[1]
         max_feat = arrs.shape[2]
-        # Adjacency matrices: one per plan, padded to max_nodes (matches source
+        # Adjacency matrices: one per plan, padded to max_nodes (matches the model input format
         # get_data.get_two_adjaceny_matrix: np.array([... for plan in X])).
         adjs = np.array([build_adjacency_matrix(all_plans[i][0]["Plan"], max_nodes)
                          for i in range(len(all_plans))])  # 3D: (n_plans, nodes, nodes)
@@ -628,28 +715,33 @@ class PerfGuardSkill:
         best_adv = -1.0
         for j, (idx, _) in enumerate(valid):
             try:
-                score = float(scores[j])  # >0.5: default faster; <0.5: candidate faster
+                score = float(scores[j])
             except Exception:
                 continue
-            adv = 1.0 - score  # candidate advantage
-            if adv > best_adv:
-                best_adv = adv
+            if score > best_adv:
+                best_adv = score
                 best_hint = idx
         return best_hint, best_adv, len(valid)
+
+    def _schema_columns_for(self, dsn):
+        if dsn not in self._schema_cols_cache:
+            self._schema_cols_cache[dsn] = _fetch_schema_columns(dsn)
+        return self._schema_cols_cache[dsn]
 
     def optimize(self, dsn, query, optimize_only):
         self._maybe_reload_model()
         t0 = time.time()
         model, fg, _ = self._snapshot
 
-        tables, edges = extract_tables_and_join_edges(query)
+        tables, edges = extract_tables_and_join_edges(query, self._schema_columns_for(dsn))
         aliases = list(tables.keys())
         if len(aliases) <= 1:
             return {"optimized_query": query,
                     "metadata": {"strategy_type": "pairwise-plan-comparison",
                                  "optimization_time": time.time() - t0, "estimated_impact": 0.0,
                                  "num_candidates": 0, "mode": "inference-only" if optimize_only else "online-training",
-                                 "note": "single-table query, no join order optimization needed"}}
+                                 "note": "single-table query, no join order optimization needed",
+                                 "model_dir": self.model_dir}}
 
         candidate_orders = generate_connected_join_orders(tables, edges, self.candidate_limit)
 
@@ -685,6 +777,17 @@ class PerfGuardSkill:
             model, fg = self._bootstrap_model(default_plan, cand_plans)
             self._snapshot = (model, fg, self._snapshot[2])
 
+        # Degrade if bootstrap failed (fg/model None) instead of crashing in
+        # _score_batch on fg.transform -> 'NoneType' has no 'transform' (HTTP 500).
+        if model is None or fg is None:
+            return {"optimized_query": query,
+                    "metadata": {"strategy_type": "pairwise-plan-comparison",
+                                 "optimization_time": time.time() - t0, "estimated_impact": 0.0,
+                                 "num_candidates": len(hints),
+                                 "mode": "inference-only" if optimize_only else "online-training",
+                                 "note": "model bootstrap failed; returning default plan",
+                                 "model_dir": self.model_dir}}
+
         best_idx, best_adv, num_valid = self._score_batch(fg, model, default_plan, cand_plans)
         best_hint = hints[best_idx] if best_idx is not None and best_idx < len(hints) else None
         optimized_query = f"/*+ Leading({best_hint}) */ {query}" if best_hint else query
@@ -694,7 +797,8 @@ class PerfGuardSkill:
                   "metadata": {"strategy_type": "pairwise-plan-comparison",
                                "optimization_time": time.time() - t0,
                                "estimated_impact": estimated_impact,
-                               "num_candidates": len(hints), "mode": mode, "best_hint": best_hint}}
+                               "num_candidates": len(hints), "mode": mode, "best_hint": best_hint,
+                               "model_dir": self.model_dir}}
 
         if not optimize_only:
             # Safe-gate: skip background EXPLAIN ANALYZE / training if the
