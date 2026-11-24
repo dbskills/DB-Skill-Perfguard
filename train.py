@@ -12,8 +12,8 @@ def train():
     adjaceny_matrix_list_x1,adjaceny_matrix_list_x2 = get_data_.get_two_adjaceny_matrix()
 
     # model training
-    model = PerfGuard(features1.shape[2],config.embd_dim, config.tensor_dim,config.dropout).cuda(config.device)
-    model= torch.nn.DataParallel(model, device_ids=config.GPU_LIST)
+    model = PerfGuard(features1.shape[2], config.embd_dim, config.tensor_dim, config.dropout).to(config.device)
+    model= torch.nn.DataParallel(model, device_ids=config.GPU_LIST) if config.CUDA else model
     optimizer = torch.optim.Adam(model.parameters(), config.init_lr)
     Loss = torch.nn.BCELoss()
     model.train()
@@ -22,7 +22,7 @@ def train():
         
         # input dim of gcn : M*D and M*M
         # output dim of gcs : M*F
-        loss = Loss(final_output, torch.tensor(label).float().cuda(config.device))
+        loss = Loss(final_output, torch.tensor(label).float().to(config.device))
         print("Epoch {}, loss {}".format(epoch+1,loss))
         loss.backward()
         optimizer.step()
